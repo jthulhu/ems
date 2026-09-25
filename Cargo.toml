@@ -1,0 +1,77 @@
+[package]
+name = "ems"
+version = "0.1.0"
+edition = "2024"
+authors = ["jthulhu <jthulhu@posteo.net>"]
+
+[dependencies]
+async-stream = "0.3.6"
+async-trait = "0.1.92"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+derive_more = { version = "2.1.1", features = ["from"] }
+emer = "1.0.0"
+enum_convert = "0.2.0"
+fast-dav-rs = "0.17.0"
+futures = "0.3.34"
+futures-util = "0.3.34"
+hex = "0.4.3"
+iana-time-zone = "0.1.65"
+icalendar = { version = "0.17.13", features = ["chrono-tz", "parser", "recurrence"] }
+icalendar-duration = "0.1.1"
+iced_aw = { version = "0.14.1", features = ["full"] }
+indented = "0.1.0"
+inline_colorization = "0.1.6"
+libpass = "0.4.0"
+libsqlite3-sys = { version = "0.37", features = ["sqlcipher"] }
+lucide-iced = "0.4.0"
+map-macro = "0.3.0"
+moka = { version = "0.12.16", features = ["sync"] }
+oo7 = "0.6.0"
+rand = "0.10.2"
+sea-orm-migration = { version = "2.0.3", default-features = false, features = ["sqlx-sqlite", "runtime-tokio"] }
+serde = "1.0.229"
+thiserror = "2.0.20"
+tokio = "1.53.1"
+tokio-uring = "0.5.0"
+toml = { version = "1.1.6", default-features = false, features = ["display", "parse", "serde", "std"] }
+totp-rs = { version = "6.0.0", features = ["otpauth"] }
+unifiedpush = "0.1.0"
+unifiedpush_storage = "0.1.0"
+unifiedpush_storage_preferences = "0.1.0"
+xdg = "3.0.0"
+
+[dependencies.iced]
+version = "0.14.0"
+features = [
+  "advanced",
+  "crisp", 
+  "linux-theme-detection", 
+  "svg", 
+  "thread-pool", 
+  "tiny-skia", 
+  "tokio", 
+  "wayland", 
+  "web-colors", 
+  "wgpu",
+]
+default-features = false
+
+[dependencies.sea-orm]
+version = "2.0.3"
+features = ["sqlx-sqlite", "runtime-tokio", "macros"]
+default-features = false
+
+[dependencies.tuta-sdk]
+git = "https://github.com/tutao/tutanota"
+tag = "tutanota-release-359.260904.0"
+package = "tuta-sdk"
+features = ["net"]
+
+[dependencies.tuta-crypto-primitives]
+git = "https://github.com/tutao/tutanota"
+tag = "tutanota-release-359.260904.0"
+package = "crypto-primitives"
+
+[profile.dev.package."*"]
+opt-level = 3

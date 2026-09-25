@@ -1,0 +1,417 @@
+#+title:em Suite
+#+author:jthulhu
+
+* em Suite
+The em Suite, stylized MS, is a personal information manager.  It features the following components
+  - a calendar manager
+  - a mail client
+  - a ledger
+  - a matrix client
+  - a contact manager
+
+It is built out of the frustration I have when trying to use existing software to do these tasks.
+MS is built with the following constaints:
+ - No JS, and minimal web technologies.  It is now standard for emails to expect that the client
+   is able to perform HTML rendering, and MS can't go against that.  However, that is the only
+   part of the whole suite where any web technology is used.  Web technologies are to be used for
+   websites, and that's it.
+ - No plain-text storage or communication.  MS will refuse to proceed if it can't store data and
+   communicate *exclusively* in an encrypted fashion.  Non-encrypted storage backends are not even
+   implemented, and will never be.
+ - Integration with the OS secret facilities.  MS will refuse to proceed if it can't interface
+   with your password manager to fetch passwords, and with the OS secret service to store
+   encryption keys.  *You will never be asked to fill in data*.
+ - Fully declarative.  MS does not support imperative-style configuration.  For instance, the *only*
+   way to add accounts is to declare them into a configuration file.  There is no "create a new
+   account" button.  Beware, *if you delete an account from the configuration file, all data
+   corresponding to that account will be wiped*. Similarly, if you add an account to the
+   configuration file, MS will automatically fetch sensitive information (such as passwords) and
+   update its database.  *MS' state is entirely controleld by its configuration file*.  This makes
+   managing MS via Nix a first-class feature, not an afterthought.
+ - Incremental work only.  MS will always to its work incrementally.  This means that, if you have
+   fetched calendar data, that data will not be refetched unless the server wants it.
+ - Keyboard-driven interface.  MS aims at having a nice. modern-looking graphical interface
+   without forcing the user to use their mouse.
+ - Transparent.  MS' errors and misbehaviours should be easily inspectable, to prevent frustration
+   when something is not working.
+ - Compatible with Tuta.  Tuta is the email provider I use.  Unfortunately, its client doesn't fit
+   my needs, and has no public documentation on how to use their non-standard API.
+ - No LLMs.  All the code is hand-written by me.
+
+This README serves both as a description of what this project does, but also a centralized
+documentation.  Implementing MS required learning various standards, raised questions about them.
+I keep here all that high-level information, to avoid having to search again for that
+information, and also to keep track of implementation decisions that have been made.
+
+*Beware*: Information in this document is not necessarily true!  I might have misunderstood or
+overlooked things.  Information is more likely to be true if it's well documented on the internet.
+
+** Features
+ - [1/2] Calendar
+   - [X] User Interface
+     - [X] Infinite scrolling view
+     - [X] Day view
+     - [X] Month view
+   - [-] Synchronization
+     - [X] Fetching data from remote
+     - [ ] Establishing a push notification system
+     - [ ] Pushing data to remote
+ - [0/1] Email
+   - [ ] Tuta
+
+* Implementation choices
+** User interface library
+I have chosen ~iced~, mainly because it boasts lot's of cool-sounding features, and because it has
+a strong ecosystem.  On the filp side, ~iced~ has basically no good documentation.
+
+This structures the rest of the application, because ~iced~ uses an ~async~ based task system.
+Hence, all subsequent library choices have to take into account the ~async~ nature of the
+application.
+
+*** ~iced~ modularisation
+To modularize the UI, we use the suggested workflow.  A module is composed of a type satisfying
+the following pseudo-trait
+#+begin_src rust
+  trait Module {
+      type InMessage;
+      type UpMessage;
+
+      fn new() -> (Self, Task<OutMessage<Self::InMessage, Self::UpMessage>>);
+      
+      async fn view(&self, ...) -> Element<'_, OutMessage<Self::InMessage, Self::UpMessage>>;
+      
+      async fn update(&mut self, message: InMessage, ...) -> Task<OutMessage<Self::InMessage, Self::UpMessage>>;
+  }
+#+end_src
+where ~OutMessage<In, Up>~ is the sum of ~In~ and ~Up~.  Basically, it looks like ~iced~ modules, except
+that the "output message" is not the same type as the "input message", with the idea that you can
+either send messages to yourself (called the ~InMessage~), or send the messages upwards (the
+~UpMessage~).  The caller module has to deal with ~UpMessage~, and pass through the ~InMessage~.
+
+Both ~view~ and ~update~ methods are ~async~, but not the ~new~ associated function, because the module
+has to be initialized to initialize the UI, and the UI has to be initialized /before/ the ~iced~
+async runtime is started.  If the module requires ~async~ initialization, there are two cases:
+ - either the initialization is expected to be fast, in which case you can just
+   ~futures::executor::block_on~: have the thread just wait for the asynchronous code finish;
+ - or, your module must have a state that encodes yet-to-be initialized data, and start a ~Task~
+   that runs the initialization code, and modify the state when initialized.  This entails that
+   the ~view~ method must be able to represent the yet-to-be initialized application.
+The first option should only be used if it introduces a delay that is not noticeable to the user!
+We want to keep the application as snappy as possible.
+
+** ~async~ runtime backend
+~iced~ restricts the available runtime backends.  I have chosen the ~tokio~ implementation, with
+several threads.
+
+I've chosen ~tokio~ because it works well with other libraries, such as ~sqlx~, which further entails
+several threads.
+
+** Database backend
+I looked at several options for the database backend:
+ - ~rusqlite~: bindings to ~sqlite~.  Rejected because:
+   - it doesn't work well with ~async~ code
+ - ~diesel~: fully-featured ORM.  Rejected because:
+   - I've tried it before, and I don't really like its migration management
+   - it doesn't support natively ~async~ (even though there seems to be ~diesel-async~, a drop-in
+     replacement that makes ~diesel~ async)
+ - ~limbo~: a rewrite or ~sqlite~ in pure Rust, with ~async~ first.  Very interesting, because the C
+   SQLite implementation doesn't utilize Linux' asynchronous features for fs IO, while ~limbo~
+   does.  Rejected because:
+   - ~limbo~ doesn't seem to feature on-disk encryption, yet.  It has some experimental features,
+     but that didn't seem mature enough.  This could change quickly though.
+ - ~sqlx~: a middle-level SQL library.  It's not an ORM, but is also higher-level than plain sqlite
+   bindings.  Accepted because
+   - it's ~async~-first (even though it still relies on the C SQLite, which doesn't utilize Linux'
+     fs IO async operations).
+   - a gotcha of ~sqlx~ with sqlcipher encryption is that this prevents ~sqlx~ from checking SQL
+     statements, because ~sqlx~ tries to connect to a /real/ database at dev time, and does so
+     without unencrypting the database.
+ - ~sea-orm~: A fully featured ORM, akin to Diesel, but more recent and less widely used.  Accepted because
+   - it's async first
+   - can use ~sqlx~
+   - has an interesting active model workflow: rather than manually specifing what data should be
+     included, you handle data with extra logic.  When you "save" the data, it does some
+     introspection to update only the data that has changed.
+   - is capable of checking queries without relying on ~sqlx~
+   - has an entity-first workflow: this means that you write Rust code, and that dictates how
+     your database is managed.  This is opposed to writing SQL declarations, and having Rust data
+     generated.  Not only I dislike the idea of generating Rust data, and I also prefer writing
+     Rust over SQL, but interacting with "real" SQL works poorly with encrypted databases.  The
+     downside is that I have to manage migrations "by hand", in the sense that not only I have to
+     declare what the data look like, but I also have to write the code that generates the
+     database schema that matches.  This /has/ to be written twice, because the data matches only
+     the latest version of the database's schema, whereas migrations have to manage versions of
+     the schema: if the schema doesn't have the latest schema, we have to run migrations to make
+     it so.
+
+** Tuta backend
+Tuta doesn't have an officially supported library.  There are three Rust libraries related to Tuta
+ - ~tuta_poll~: it speaks to Tuta over the web directly, using an undeclared API.  This looks cool,
+   and documented, but doesn't have enough features: it can basically:
+   - fetch data
+   - set read status
+ - ~tutabridge~: it's not really a library, rather an application that translates the Tuta API into
+   standard IMAP/SMTP API.
+   - I think it's (at least partially) LLM generated.
+   - It doesn't have any kind of documentation :'(
+   - it relies on the Tuta SDK, but actually on a forked version with extra patches, whereas I
+     want to depend on the upstream Tuta SDK, to
+     - avoid having client version mismatch
+     - have the latest security fixes directly
+   - I want to make a "native" Tuta library, which eventually has to support lots of features
+ - ~tuta-sdk~: it's a library, but it's not even published on ~crates.io~.  Instead, one has to
+   depend directly on their git repository.  Furthermore, it's not documented at all, there are
+   no examples.
+We try to write a native client depending directly on ~tuta-sdk~, but so far I haven't managed
+performing a login flow yet.
+
+The ~tuta-sdk~ handles on-disk encrypted data natively.  This means that ~tuta-sdk~ asks you to offer
+a key/value storage implementation, and will use that to store an encrypted database, including
+text indexes for full-text search, or things alike.  Hence, it would be a bad choice to store
+these key/value pairs inside a database: we would have a database inside a database, leading to
+useless performance penalties.
+
+Hence, we choose to write this data directly in files, each key being a path to the file with the
+data.  Because we want to avoid IO blocking operations within an ~async~ runtime, we could either
+perform these operations on dedicated threads (for instance using ~tokio::spawn_blocking~).
+However, disk operations are more likely to be IO bound than CPU bound, and thus, it seems a good
+fit for a native async implementation.  This is possible using Linux async fs features.
+
+** Keyring backend
+I'm not sure whether there exist alternatives to the ~oo7~ crate, but since this one does all I
+need and is ~async~ first, I've opted for it.
+
+** WebDAV backend
+I want to have my calendars and contacts handled by a Nextcloud instance, through a CalDAV and
+CardDAV API.  CalDAV and CardDAV are specialized WebDAV standards, in the sense that they define
+a protocol that relies on the WebDAV protocol to exchange data between the client and the server.
+
+There are several WebDAV, and even CalDAV or CardDAV clients:
+ - ~libdav~: a robust and exhaustive implementation of CalDAV and CardDAV.  Rejected because:
+   - ~fast-dav-rs~ seems more efficient (I'm not sure efficiency here is really a problem, but why
+     not get faster libraries...)
+ - ~minicaldav~: a lightweight implementation.  Rejected because:
+   - it's not ~async~-first.
+ - ~fast-dav-rs~: a streaming, fast implementation.  Accepted because
+   - it's ~async~-first
+   - it supports modern features to handle large datasets, such as:
+     - incremental sync
+     - batch operations
+     - streaming results
+     I'm not sure this is useful yet, but it's nice to have a library that can easily scale if
+     this becomes necessary.
+ - ~io-webdav~:  similar to ~fast-dav-rs~.  Rejected because:
+   - I don't have reasons to choose one of ~io-webdav~ or ~fast-dav-rs~ over the other, because they
+     look very similar.
+ - ~aimcal-caldav~: seems to bundle many more features, including WebDAV client.  For instance, AI
+   support, and stuff like that.  Rejected because:
+   - it does too much, I want to have finer control
+ 
+** Password store backend
+I'm not sure whether there exists a generic password manager API.  Since I use GNU Pass, I only
+looked at libraries that can handle that.
+ - ~libpass~: a native Rust implementation of GNU Pass.  It's not as fully-featured as GNU Pass,
+   but it does all I need.  Accepted because:
+   - it's ~async~-first
+   - it can easily read passwords from the store
+
+I don't know whether other libraries exists, but this one does what I need, so I haven't looked
+further.
+
+** push-notification backend
+Push notification is a synchronization strategy that is supposed to more efficient than the naive
+one.
+
+The naive approach is to have one or both of:
+ - user-triggered synchronization.  It's good to have them, but it's annoying because one ends up
+   refreshing again and again, or missing notifications.
+ - polling, that is, performing synchronization periodically.  This is a bad solution because:
+   - it consumes more resources, including battery.  If every application that required
+     synchronizing data used polling, battery usage would be much higher.  See what Android does.
+   - it introduces lattency for the user, which is (very) annoying.
+
+The good way to handle this is to have the server notify us when we have to do some
+synchronization.  If the setup is properly done, the delay between the event being receiving by
+the server and the user seeing the event being applied in the interface should be at most tens or
+hundreds of milliseconds.
+
+However, this still consumes a significant of battery, because each application has to keep a
+connection alive, which is not an entirely passive operation (passive in the sense that it
+doesn't consume resources when nothing happens).  To optimize this further, we can ask a
+/notification server/ to open all these connections, have all applications of our system create a
+/single/ connection to that server, and then some OS service is in charge of dispatching
+notifications to applications to which they belong.  This is precisely the role of the
+UnifiedPush standard.  It's a standard that handles specifies both the API that a notification
+server should expose, and the OS service API.
+
+For instance, Nextcloud can offer a UnifiedPush service, to be used coupled with Nextcloud
+authentication.
+
+For the OS side, KDE has implemented a OS service that respects the API, called
+~kunifiedpush-provider~.  It doesn't have to be installed alongside KDE, it can be used as a
+standalone UP provider.  It is, as far as I know, the only such implementation.
+
+Note that Nextcloud WebDAV implements a WebDAV Push API, which is compatible with Unified Push.
+
+*** Unified Push backends
+Unified Push has an official Rust implementation, called ~unifiedpush-rs~.  I'm not aware of
+alternatives.
+
+However, ~unifiedpush-rs~ requires a storage backend, to store the application side state of the
+Unified Push implementation (such as which distributor to use).  Because I don't want to store
+any data un-encrypted on-disk, I have to implement one that encrypts data.
+
+** iCalendar backend
+CalDAV is a transport protocol, that transports iCalendar data, which is the support that
+actually contains relevant data for the application.
+
+This means that we need an iCalendar parser.  However, iCalendar having some... complexities, it
+also require a library that generates occurrences out of iCalendar data.  These two operations
+are not necessarily performed by the same library.
+
+- ~ical~: a robust library for parsing iCalendar entries.
+- ~calcard~: a robust library for parsing iCalendar and vCard entries.
+- ~icalendar~: again, a robust library for parsing iCalendar entries.
+- ~rrule~: a library for generating occurrences out of an iCalendar event
+- ~rrules~: a library for generating occurrences out of an iCalendar event
+
+I have to say... most of these libraries are very similar.  ~icalendar~ offers a slightly higher
+level API, and also offers integration with ~rrule~ to have access to its features via the same
+~icalendar~ API.  Because of this conveniences, I chose ~icalendar~ / ~rrule~ combination.
+
+** ~async~ filesystem operations backend
+Linux offers async the IO interface ~io_uring~.
+
+ - ~io-uring~: low-level bindings to Linux' ~io_uring~.  Rejected because:
+   - it's too low-level
+ - ~tokio-uring~: higher-level bindings, with ~tokio~ integration.  Accepted because:
+   - lack of alternatives
+   - does what I need
+
+** UI cache backend
+The architecture of the application is to have the UI state contain a cache of the data, and a
+database containing the actual data.  When the UI requires some information (such as: "what are
+the events happening on this day?"), we don't want it to fetch it in the database directly,
+because that would make the UI sluggy.  Instead, it asks a background process to fetch that data,
+and fill in UI's cache.  The UI only reads the cache to show information.
+
+We want the cache to implement cache unloading on its own (that is, the cache should forget about
+information that is no longer useful to the UI on its own, without the UI explicitely specifying
+which data it doesn't need anymore).  It also has to be capable of accepting writes from the
+background process, while there are reads from the UI.
+
+I haven't looked a lot at alternatives to ~moka~, because ~moka~ has all the features required.  Note
+that we do not use the ~async~ version of ~moka~ on purpose, because reads *must not* be asynchronous:
+UI drawing must be immediate!
+
+This entails that writes are blocking, which could be counter-productive.  However, in practice,
+writes are fast, so we don't need to offload the writes on another thread.
+
+* Specs
+All data is stored in SQLite databases, fully encrypted with SQLcipher.  This means that every
+connection must, when established, specify the encryption key.
+
+The encryption key itself is stored in the OS keyring.  If the OS has no keyring backend, then
+the process should just fail.  There is no safe way to recover, because then there is no way to
+store secrets fully encrypted on disk.
+
+By default, we do not use a special ~id~ auto-incremented primary key.  Instead, we make the
+primary key the data that actually uniquely identifies data.  Using SQLite as backend, it's not
+much of an overhead, and this helps keeping the table data close to the real world constraints.
+
+The main exception is when we need to have recursive data.  For instance, when we store a ~folder~
+data, it has to reference its parent, and we can't do that without an internal ~id~.
+
+** Calendar
+A CalDAV server can serve multiple calendars, each with their own ~href~, which acts as a unique
+ID.  A calendar itself is composed of several objects, which are served indipendently.  If we
+think of the calendar as a directory, objects would be ~ics~ files within the directory.  Each
+object typically defines one or more events.  Events typically define one or more occurrence.
+
+Each object must have exactly one, unique event ~UID~ used throughout all events defined in it.
+Within an object, events can either
+- simple events: events with a single occurrence;
+- recurring events: events with a recurrence rule to generate all its occurrences;
+- exception events: modifications to recurrence rules found in an other recurring event *in the same object*.
+
+Hence, to generate all occurrences, one must:
+- handle each object separatly
+- for each /main event/ (ie. one that generates occurrences),  generate all of its occurrences
+- for each /exception event/, correct the generated events
+
+*** Incremental synchronization
+Incremental synchronization for CalDAV works as follows.  Whenever we make a request, if the
+server implements incremental synchronization (modern implementations, such as Nextcloud, do), it
+returns a ~sync_token~ which represents a timestamp.  Basically, you have received all the data as
+it exists on the server, up to the timestamp represented by the ~sync_token~.  Conversely, when we
+make a request, we can also include a ~sync_token~, and the server will only include modifications
+since that timestamp.
+
+Exceptionnaly, if the server has restructured its internal data, or if it has deleted the data
+required to compute the delta given a ~sync_token~ (which can happen if you don't use that token
+for a long time, or if there are too many tokens issued by the server), the server can indicate
+to you that it will give you the /full/ data, asking you to forget local data and reset to what the
+server just sent you.
+
+Keep in mind that incremental synchronization happens at the /calendar/ level.  Each level has a
+token.  Hence, performing an incremental synchronization for a given user will involve several
+incremental synchronizations, one for each calendar.
+
+*** FAQ
+- Is it possible for a recurrent event, and for some associated exceptions, to have different
+  datetime kinds?
+
+  No, the exception event datetime should have the *same* timezone and type as its associated event.
+- Is it possible for two events in different objects to interfere with each other?
+
+  No, an exception event can only affect events defined in the same object.
+
+** Email
+*** Incremental synchronization
+Email has a stateful incremental synchronization.  This means that you don't add to
+synchronization requests some information that allows the user to send only delta information.
+
+Instead, you have to add some information to the current /session/, and then make the sync requests
+throught that session.
+
+*** Database specification
+**** Email account
+An email account is the data of
+ - an ~email~, which uniquely identifies an email account
+ - an IMAP URL and port
+ - a SMTP URL and port
+ - the password to access both of these servers
+We assume that both the IMAP and SMTP servers use the same credentials.  While this is not
+necessarily true, it's true for basically all my email accounts, and I'm not aware of an email
+provider I could use for which this isn't true.
+
+The constraints are
+- the ~email~ is a primary key
+
+**** Email folder
+An email folder is the data of
+ - implementation details
+   - an ~id~, a meaningless auto-incremented value
+ - email synchronization details
+   - a ~uid_validity~ id.  This does not need to be unique.  The purpose of this id is to check
+     whether the remote server has structurally change its internal data.  If this is the case,
+     the data we have locally might not match anymore the remote data when doing incremental
+     synchronization so, instead
+ - the ~email_id~ of the email account this folder lives in
+ - ~parent_id~, the ~id~ of the parent folder, which might be ~NULL~ in case the folder is a root folder
+
+The constraints are
+- the ~id~ 
+
+Email folders have an ~id~ because they encode a recursive tree structure.
+
+*** FAQ
+- Is the ~Message-ID~ header mandatory?
+
+  No, and this header might be abused by spammers or malformed due to outdated mailing systems.
+  You have to handle properly missing, malformed or non-unique ~Message-ID~.  However, since
+  "normal" mail systems do create unique ~Message-ID~, the UI is allowed to render weirdly messages
+  that don't have a unique ~Message-ID~.
+
+** Tuta
+Fuck...
