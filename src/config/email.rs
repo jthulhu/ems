@@ -5,13 +5,14 @@ use serde::{Deserialize, Serialize};
 use super::Config;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Hash, PartialEq, Eq)]
-pub struct TutaAccountConfig {
-    pub login: String,
+pub struct JmapAccountConfig {
+    email: String,
+    server: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Hash, PartialEq, Eq)]
 pub struct EmailConfig {
-    pub tuta_accounts: Vec<TutaAccountConfig>,
+    pub jmap_accounts: Vec<JmapAccountConfig>,
     #[serde(default = "EmailConfig::default_database_path")]
     pub database_path: PathBuf,
 }
@@ -19,7 +20,7 @@ pub struct EmailConfig {
 impl Default for EmailConfig {
     fn default() -> Self {
         Self {
-            tuta_accounts: Vec::new(),
+            jmap_accounts: Vec::new(),
             database_path: Self::default_database_path(),
         }
     }

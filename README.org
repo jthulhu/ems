@@ -36,7 +36,7 @@ MS is built with the following constaints:
    when something is not working.
  - Compatible with Tuta.  Tuta is the email provider I use.  Unfortunately, its client doesn't fit
    my needs, and has no public documentation on how to use their non-standard API.
- - No LLMs.  All the code is hand-written by me.
+ - *No LLMs*.  All the code is hand-written by me.
 
 This README serves both as a description of what this project does, but also a centralized
 documentation.  Implementing MS required learning various standards, raised questions about them.
@@ -56,8 +56,15 @@ overlooked things.  Information is more likely to be true if it's well documente
      - [X] Fetching data from remote
      - [ ] Establishing a push notification system
      - [ ] Pushing data to remote
- - [0/1] Email
+ - [0/2] Email
+   - [ ] User interface
    - [ ] Tuta
+   - [ ] Standard email accounts
+     - [ ] Database
+       - [ ] Full text search
+     - [ ] Synchronization
+       - [ ] Incremental synchronization
+       - [ ] Push notifications
 
 * Implementation choices
 ** User interface library
@@ -288,7 +295,7 @@ Linux offers async the IO interface ~io_uring~.
    - lack of alternatives
    - does what I need
 
-** UI cache backend
+** UI ceache backend
 The architecture of the application is to have the UI state contain a cache of the data, and a
 database containing the actual data.  When the UI requires some information (such as: "what are
 the events happening on this day?"), we don't want it to fetch it in the database directly,
@@ -307,6 +314,22 @@ UI drawing must be immediate!
 This entails that writes are blocking, which could be counter-productive.  However, in practice,
 writes are fast, so we don't need to offload the writes on another thread.
 
+** Mail parser backend
+The plain email format is annoying to store in a database, because it encodes a nested data
+structure.  ~mail-parser~ is capable of flattening that structure, exposing:
+ - headers
+ - mail content, in different formats (plain text, HTML, ...)
+ - attachments
+
+** HTML renderer backend
+A simple HTML render has to be used, to render emails, compatible with iced.
+
+ - ~iced_webview~: an ~iced~ widget based on Ultralight or Webkit.  Rejected because
+   - Ultralight is proprietary
+   - Webkit is /waaaaayyyyy/ overkill, we want to render static HTML with basic CSS support
+   - I'm not sure it's possible to capture resource resolution
+ - ~iced_webview_v2~: an ~iced~ widget supporting several backends
+
 * Specs
 All data is stored in SQLite databases, fully encrypted with SQLcipher.  This means that every
 connection must, when established, specify the encryption key.
@@ -321,6 +344,10 @@ much of an overhead, and this helps keeping the table data close to the real wor
 
 The main exception is when we need to have recursive data.  For instance, when we store a ~folder~
 data, it has to reference its parent, and we can't do that without an internal ~id~.
+
+** Code overview
+The whole configuration, which is very important because it drives the state of the application,
+is present in ~src/config.rs~.
 
 ** Calendar
 A CalDAV server can serve multiple calendars, each with their own ~href~, which acts as a unique
@@ -367,44 +394,303 @@ incremental synchronizations, one for each calendar.
   No, an exception event can only affect events defined in the same object.
 
 ** Email
-*** Incremental synchronization
+Email works with two main protocols: IMAP and SMTP.
+
+IMAP has the purpose of exposing a filesystem-like interface, exposing the remote storage of
+emails.  The IMAP standard is built around capabilities, that is, features that the server
+supports.
+
+SMTP, on the other hand, serves as a protocol for exchanging emails.  Note that, as an email
+client, we don't need to care about how an email is received: the server handles that, and stores
+them, which can then be queried via IMAP.
+
+However, I've realized later that IMAP is an old, broken protocol.  For instance, even "modern"
+support for push notifications:
+ - do not support UnifiedPush
+ - permit only to listen for modifications on a *single directory* at a time
+
+Here is a more complete comparison matrix of features that are especially relevant to me.  There
+are other differences, usch as JMAP using JSON format for payload, whereas the IMAP protocol is a
+custom, command-based format, making JMAP easier to implement, but since I use libraries for
+both, it doesn't affect me.
+
+| Feature            | *IMAP*                                      | *JMAP*                 |
+|--------------------+-------------------------------------------+----------------------|
+| *Push notifications* | Not always supported, only per-directory  | Per account, with UP |
+| *Session state*      | Stateful                                  | Stateless            |
+| *Can send emails*    | No, requires SMTP                         | Yes                  |
+| *Used ports*         | 143 or 993                                | 443 (HTTPS)          |
+| *Can move emails*    | Not natively, introduces a lot of re-sync | Yes                  |
+| *Batch operations*   | No                                        | Yes                  |
+| *Bandwidth usage*[fn:1]  | Medium                                    | Low                  |
+| *Threads*            | Not commonly supported                    | Built-in             |
+| *Tags*               | No                                        | Yes                  |
+
+For these reasons, I'm switching to an  email provider that supports JMAP.
+
+[fn:1] See https://jmap.io/why-jmap/#better-performance.
+
+*** IMAP spec
+Note that this section is outdated, I know focus only on the JMAP protocol.
+
+**** IMAP Capabilities
+The IMAP protocol functions by sending plain text commands over a session.  It is important to
+note that the IMAP protocol is /stateful/: a session is first established, including login.  Each
+command starts with a command identifier, any string that is used for the server to signal which
+command it responds to.
+
+Email servers disclose "capabilities", that is, features of the standard they support.  Here is a
+quick reminder of relevant capabilities
+ - ~ID~: this capability permits sending software information, mainly for debugging and telemetry.
+ - ~IDLE~: this capability offers an similarly named command, that waits for extra data to arrive.
+   This is a very efficient push notification system.
+ - ~SPECIAL-USE~: allows the server to tag special directories, like, which directory is the
+   "Trash" directory, regardless of the actual name of the directory.
+ - ~CONDSTORE~ and ~QRESYNC~: the ~CONDSTORE~ capability allows the client to ask for a timestamp for
+   each folder.  This timestamp represents the date up to which the data stored by the client is
+   in sync.  On the other hand, ~QRESYNC~ allows the client to ask "what happened since a given
+   moment", where the moment is encoded by the token provided by ~CONDSTORE~.  This permits
+   efficient, incremental synchronization.
+ - ~QUOTA~: allows the server to disclose how much space is available on the server, and the total
+   space allocated for the user.  This is mainly a UI feature.
+ - ~CHILDREN~: allows the server to disclose whether a directory has children directories without
+   the user having to query for them.
+ - ~NAMESPACE~: the folders on the server might belong entirely to the user, to someone else, or be
+   shared.  This capability allows the client to understand which folders are in which category.
+
+There list is far from being exhaustive, but lot's of capabilities are not relevant for the end
+user.  We're talking about how to perform the login flow, how to improve the communication, etc.
+Many features are also useful to ask the server to perform a query.  MS will not use this
+feature, as we prefer synchronizing data locally, and running the query on local data.
+
+Dovecot, a free and open source IMAP server implementation, supports all of the above
+capabilities.  Therefore, we can reasonably expect all servers to implement them, and avoid
+burdening ourselves with "compatibility".
+ 
+**** Incremental synchronization
 Email has a stateful incremental synchronization.  This means that you don't add to
 synchronization requests some information that allows the user to send only delta information.
 
 Instead, you have to add some information to the current /session/, and then make the sync requests
 throught that session.
 
+*** JMAP spec
+One important aspect of JMAP is that it separates the synchronization of the folder structure,
+and of emails.  This results in two synchronization tokens, one for the folder structure, one for
+emails.
+
+**** Folder roles
+The JMAP server might assign to certain directories a role, which is simply a string supposedly
+meant to represent the purpose of the directory, regardless of its name.  The standardized roles
+are:
+ - ~inbox~ where emails arrive when received
+ - ~drafts~ where emails are stored while being written
+ - ~outbox~ where emails finished, but still in the sent queue, are stored
+ - ~sent~ sent emails
+ - ~trash~ trashed emails
+ - ~archive~ supposedly, emails that have been "processed" by the user
+ - ~junk~ emails that were (manually or automatically) marked as uninteresting or malicious
+
+Note that a single role might be assigned to several directories, except for ~inbox~, ~outbox~ and
+~drafts~.
+
 *** Database specification
-**** Email account
-An email account is the data of
- - an ~email~, which uniquely identifies an email account
- - an IMAP URL and port
- - a SMTP URL and port
- - the password to access both of these servers
-We assume that both the IMAP and SMTP servers use the same credentials.  While this is not
-necessarily true, it's true for basically all my email accounts, and I'm not aware of an email
-provider I could use for which this isn't true.
+**** JMAP account
+The ~jmap_account~ table is:
+ - ~email : Text~, which uniquely identifies an email account
+ - ~provider : Text~, the URL of the email provider
+ - ~password : Text~, the password of the account
+ - ~folder_token : Text~ a synchronization token for the folder structure
+ - ~email_token : Text~ a synchronization token for the emails
 
-The constraints are
-- the ~email~ is a primary key
+Constraints:
+ - the ~email~ is a primary key
 
-**** Email folder
-An email folder is the data of
- - implementation details
-   - an ~id~, a meaningless auto-incremented value
- - email synchronization details
-   - a ~uid_validity~ id.  This does not need to be unique.  The purpose of this id is to check
-     whether the remote server has structurally change its internal data.  If this is the case,
-     the data we have locally might not match anymore the remote data when doing incremental
-     synchronization so, instead
- - the ~email_id~ of the email account this folder lives in
- - ~parent_id~, the ~id~ of the parent folder, which might be ~NULL~ in case the folder is a root folder
+**** JMAP folder
+The ~jmap_folder~ table is:
+ - ~account_id : Text~, the id of the account this folders lives in
+ - ~id : Text~, a unique identifier *given by the server*
+ - ~parent_id : Text?~ the id of the parent directory, if any
+ - ~name : Text~ the user-facing name of the directory
+ - ~role : Text?~ the "role" of the directory, null if the directory has no roles
+   
+Constraints:
+ - ~(account_id, id)~ is the primary key
+ - ~account_id~ is a foreign key mapping to ~email~ of ~email_account~
+ - ~(account_id, parent_id)~ is a foreign key mapping to ~(account_id, id)~ of ~email_folder~
 
-The constraints are
-- the ~id~ 
-
+Indexes:
+ - ~index-folder-account~:
+   - ~account_id~
+ - ~index-folder-parent~:
+   - ~account_id~
+   - ~parent_id~
+ 
 Email folders have an ~id~ because they encode a recursive tree structure.
 
+**** JMAP email
+The ~jmap_email~ table is:
+ - ~account_id : Text~, the id of the account this folders lives in
+ - ~id : Text~, a unique identifier *given by the server*
+ - ~raw_id : Text~, a reference to the raw MIME data stored by the server
+ - ~thread_id : Text~, a thread identifier generated by the server, permitting to group emails by
+   thread
+ - ~subject : Text?~, the subject of the email
+ - ~preview : Text~ a preview generated by the server
+ - ~received_at : Integer~ the UNIX timestamp of the moment the email was received
+ - ~sent_at : Integer?~ the UNIX timestamp of the moment the email was sent, if the sender included
+   that information
+
+Constraints:
+ - ~(account_id, id)~ is the primary key
+ - ~account_id~ is a foreign key mapping to ~email~ of ~jmap_account~
+
+Indexes:
+ - ~index-email-account~
+   - ~account_id~
+ 
+**** JMAP Email in folder
+The ~jmap_email_in_folder~ table is:
+ - ~account_id : Text~, the id of the account
+ - ~folder_id : Text~, the id of the folder
+ - ~email_id : Text~ the id of the email
+
+Constraints:
+ - ~(account_id, folder_id, email_id)~ primary key
+ - ~(account_id, folder_id)~ is a foreign key to ~(account_id, id)~ in ~jmap_folder~
+ - ~(account_id, email_id)~ is a foreign key to ~(account_id, id)~ in ~jmap_email~
+
+Indexes:
+ - ~index-email_in_folder-folder~:
+   - ~account_id~
+   - ~folder_id~
+ - ~index-email_in_folder-email~:
+   - ~account_id~
+   - ~email_id~
+ 
+**** JMAP Email has keyword in folder
+Keywords (also called /tags/ or /labels/) are, in JMAP, not stored /per email/, but /per email in a
+directory/.  This means that an email can have a different set of tags, when seen in different
+directories.
+
+The ~jmap_email_in_folder_has_keyword~ table is:
+ - ~account_id : Text~, the id of the account
+ - ~email_id : Text~, the id of the email
+ - ~folder_id : Text~, the id of the folder
+ - ~keyword : Text~, the keyword
+
+Constraints:
+ - ~(account_id, email_id, folder_id, keyword)~ primary key
+ - ~(account_id, email_id, folder_id)~ is a foreign key to ~(account_id, email_id, folder_id)~ in ~jmap_email_in_folder~
+
+Indexes:
+ - ~index-email_has_keyword_in_folder-email_in_folder~:
+   - ~account_id~
+   - ~email_id~
+   - ~folder_id~
+
+**** JMAP Email has address
+This table records the headers that an email can have.  JMAP only stores
+ - ~from~
+ - ~to~
+ - ~cc~
+ - ~bcc~
+as headers, and each of those has, attached, an address, which is an email address with optionally a display name
+   
+The ~jmap_email_has_address~ table is:
+ - ~account_id : Text~, the id of the account
+ - ~email_id : Text~, the id of the email
+ - ~type : Text~, one of the headers listed above
+ - ~display_name : Text?~, an optional better way to display an address
+ - ~email_address : Text~ the email address
+ - ~position : Integer~ the order in which this entry occurs
+
+Contraints:
+ - ~(account_id, email_id, type, position)~ primary key
+ - ~(account_id, email_id)~ is a foreign key to ~(account_id, id)~ in ~jmap_email~
+
+Indexes:
+ - ~index-email_has_address-email~:
+   - ~account_id~
+   - ~email_id~
+ 
+**** JMAP Email content
+The ~jmap_email_content~ table is:
+ - ~account_id : Text~, the id of the account
+ - ~email_id : Text~, the id of the email
+ - ~text_content : Text?~, the plain-text version of the email
+ - ~html_content : Text?~, the HTML version of the email
+
+Contraints:
+ - ~(account_id, email_id)~ primary key
+ - ~(account_id, email_id)~ foreign key to ~(account_id, id)~ in ~jmap_email~
+   No index for this foreign key is required, as it matches the primary key.
+
+Indexes:
+ 
+**** JMAP Email attachment
+The ~jmap_email_attachment~ table is:
+ - ~account_id : Text~, the id of the account
+ - ~email_id : Text~, the id of the email
+ - ~id : Text~, the id of the attachment
+ - ~name : Text?~, the name of the attachment
+ - ~mime_type : Text~ the MIME type of the attachment
+ - ~size : Integer~, the byte size of the file
+
+Constraints:
+ - ~(account_id, email_id, id)~ primary key
+ - ~(account_id, email_id)~ is a foreign key to ~(account_id, id)~ in ~jmap_email~
+
+Indexes:
+ - ~index-email_attachment-email~:
+   - ~account_id~
+   - ~email_id~
+ 
+The email attachment can then be fetched at the endpoint `/download/{account_id}/{id}`
+
+**** Asset
+Embedded assets are attachments that are used to render the email, rather than meant to be
+downloaded as standalone files.
+
+Countrary to email attachments, these are often small, so they're better suited to be stored in
+the database.
+
+To avoid duplicating embedded assets (there are lots of duplicated assets, such as corporate
+pictures), we store them with their hash, and have an extra join table to link them with the
+email.
+
+The ~asset~ table is:
+ - ~sha256_hash : Text~, the hash of the asset
+ - ~size : Integer~ the byte size of the asset
+ - ~data : Blob~, the data itself
+
+Constraints:
+ - ~sha256_hash~ primary key
+
+**** JMAP Email has asset
+The ~jmap_email_has_asset~ table is:
+ - ~account_id : Text~, the account id
+ - ~email_id : Text~, the id of the email
+ - ~id : Text~ the id of the attachment
+ - ~cid : Text?~ the reference of the attachment within the email, to be used like ~<img src="cid:xxxx">~
+ - ~asset_hash : Text~, the hash of the asset
+ - ~mime_type : Text~ the MIME type of the asset
+
+Constraints:
+ - ~(account_id, email_id, id)~ primary key
+ - ~(account_id, email_id)~ is a foreign key to ~(accound_id, id)~ in ~jmap_email~
+ - ~asset_hash~ is a foreign key to ~sha256_hash~ in ~email_asset~
+
+Indexes:
+ - ~index-email_has_asset-email~:
+   - ~account_id~
+   - ~email_id~
+ - ~index-email_has_asset-asset~:
+   - ~asset_hash~
+
+~cid~ can be ~NULL~ because JMAP has another way for the email to reference embedded assets, using
+URLs.
+ 
 *** FAQ
 - Is the ~Message-ID~ header mandatory?
 
@@ -412,6 +698,15 @@ Email folders have an ~id~ because they encode a recursive tree structure.
   You have to handle properly missing, malformed or non-unique ~Message-ID~.  However, since
   "normal" mail systems do create unique ~Message-ID~, the UI is allowed to render weirdly messages
   that don't have a unique ~Message-ID~.
+- Can the client modify the roles of a directory, in JMAP
 
-** Tuta
-Fuck...
+  No.  Such a query will result in the server reporting an error.
+  
+* Code checks
+Before pushing a new release, the following checks should be performed
+ - License checks.  Run ~cargo deny check licenses~.  This ensure all libraries used are comaptible
+   with the license this project is distributed with.
+ - Clippy checks.  Run ~cargo clippy~.  This catches common gotchas.
+ - Formatting checks.  Run ~cargo fmt --check~.  This ensures the code is written in a normalized
+   fashion, avoiding meaningless modifications when your editor tries to format code differently
+   than it is.

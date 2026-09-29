@@ -63,16 +63,5 @@ version = "2.0.3"
 features = ["sqlx-sqlite", "runtime-tokio", "macros"]
 default-features = false
 
-[dependencies.tuta-sdk]
-git = "https://github.com/tutao/tutanota"
-tag = "tutanota-release-359.260904.0"
-package = "tuta-sdk"
-features = ["net"]
-
-[dependencies.tuta-crypto-primitives]
-git = "https://github.com/tutao/tutanota"
-tag = "tutanota-release-359.260904.0"
-package = "crypto-primitives"
-
 [profile.dev.package."*"]
 opt-level = 3

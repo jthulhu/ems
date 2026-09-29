@@ -12,6 +12,8 @@ mod calendar_objects {
     };
     use sea_orm_migration::SchemaManager;
 
+    use crate::db::migrations::fk_name;
+
     use super::calendar::Calendar;
 
     #[derive(Debug, DeriveIden)]
@@ -58,11 +60,7 @@ mod calendar_objects {
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name(format!(
-                                "fk-{}-{}",
-                                CalendarObject::Table.into_iden(),
-                                Calendar::Table.into_iden()
-                            ))
+                            .name(fk_name(CalendarObject::Table, Calendar::Table))
                             .from(
                                 CalendarObject::Table,
                                 (
@@ -102,6 +100,8 @@ mod calendar {
     };
     use sea_orm_migration::SchemaManager;
 
+    use crate::db::migrations::fk_name;
+
     use super::calendar_account::CalendarAccount;
 
     #[derive(Debug, DeriveIden)]
@@ -135,11 +135,7 @@ mod calendar {
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name(format!(
-                                "fk-{}-{}",
-                                Calendar::Table.into_iden(),
-                                CalendarAccount::Table.into_iden(),
-                            ))
+                            .name(fk_name(Calendar::Table, CalendarAccount::Table))
                             .from(
                                 Calendar::Table,
                                 (Calendar::AccountUser, Calendar::AccountServer),

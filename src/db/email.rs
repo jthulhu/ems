@@ -1,70 +1,243 @@
 use std::{
     collections::HashSet,
     io,
+    iter::once,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use emer::{raise, throw};
+use iced::{
+    Color, Element, Font, Pixels,
+    font::{Style, Weight},
+    widget::{
+        Column, span,
+        text::{Rich, Span},
+    },
+};
 use libpass::StoreEntry;
 use migrations::TutaMigrationHandler;
 use sea_orm::{
     ActiveValue, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
     EntityTrait, QueryFilter, TransactionTrait,
 };
-use tuta_account::Entity;
-use tuta_sdk::{
-    GeneratedId, HeadersProvider, LoggedInSdk, Sdk,
-    bindings::{
-        file_client::{FileClient, FileClientError},
-        rest_client::RestClient,
-    },
-    crypto_entity_client::CryptoEntityClient,
-    login::Credentials,
-    net::native_rest_client::NativeRestClient,
-    services::service_executor::{self, ServiceExecutor},
-};
+use serde::{Deserialize, Serialize};
 use xdg::BaseDirectories;
 
 use crate::{
-    config::email::TutaAccountConfig,
     error::{ErrorKind, Result},
     uring::{self, DiskInterface},
 };
 
 use super::passphrase::get_passphrase;
 
-mod email_account;
-mod email_data;
-mod email_folder;
-mod migrations;
-mod tuta_account;
-mod tuta_credential;
+mod asset;
+mod jmap_account;
+mod jmap_email;
+mod jmap_email_attachment;
+mod jmap_email_content;
+mod jmap_email_has_address;
+mod jmap_email_has_asset;
+mod jmap_email_has_keyword_in_folder;
+mod jmap_email_in_folder;
+mod jmap_folder;
 
-pub struct TutaSession {
-    pub session: LoggedInSdk,
-    pub email: String,
-    pub token: String,
+mod migrations;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailBody {
+    pub body: Body,
 }
 
-impl TutaSession {
-    async fn new(
-        username: &str,
-        password: &str,
-        api_url: &str,
-        base_dir: BaseDirectories,
-        disk: DiskInterface,
-    ) -> Result<Self> {
-        let rest_client: Arc<dyn RestClient> = Arc::new(NativeRestClient::try_new().unwrap());
-        let file_client: Arc<dyn FileClient> = Arc::new(FileMapper::new(username, base_dir, disk));
-        let sdk = Sdk::new_without_suspension(api_url.to_string(), rest_client, file_client);
-        // sdk.
-        todo!()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Body {
+    pub children: Vec<FlowElement>,
+}
+
+impl<'a, Msg: 'a> From<Body> for Element<'a, Msg> {
+    fn from(value: Body) -> Self {
+        value
+            .children
+            .into_iter()
+            .map(Into::into)
+            .collect::<Column<'a, Msg>>()
+            .into()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FlowElement {
+    Div {
+        children: Vec<FlowElement>,
+    },
+    Table {
+        rows: Vec<TableRow>,
+    },
+    Paragraph {
+        children: Vec<PhraseElement>,
+    },
+    Heading {
+        level: u8,
+        children: Vec<PhraseElement>,
+    },
+}
+
+impl<'a, Msg: 'a> From<FlowElement> for Element<'a, Msg> {
+    fn from(value: FlowElement) -> Self {
+        match value {
+            FlowElement::Div { children } => children
+                .into_iter()
+                .map(Into::into)
+                .collect::<Column<'a, Msg>>()
+                .into(),
+            FlowElement::Table { rows } => todo!(),
+            FlowElement::Paragraph { children } => children
+                .into_iter()
+                .flat_map(PhraseElement::spans)
+                .collect::<Rich<'a, String, Msg>>()
+                .into(),
+            FlowElement::Heading { level, children } => todo!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableRow {
+    pub cells: Vec<TableCell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableCell {
+    pub children: Vec<FlowElement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PhraseElement {
+    Text(String),
+    Span {
+        children: Vec<PhraseElement>,
+    },
+    Strong {
+        children: Vec<PhraseElement>,
+    },
+    Emphasis {
+        children: Vec<PhraseElement>,
+    },
+    Link {
+        href: String,
+        children: Vec<PhraseElement>,
+    },
+    Image {
+        src: String,
+        description: String,
+        width: u32,
+        height: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct SpanStyle {
+    color: Option<Color>,
+    size: Option<Pixels>,
+    link: Option<String>,
+    underline: bool,
+    bold: bool,
+    strikethrough: bool,
+    emph: bool,
+    mono: bool,
+}
+
+impl Default for SpanStyle {
+    fn default() -> Self {
+        Self {
+            color: None,
+            size: None,
+            link: None,
+            underline: false,
+            bold: false,
+            strikethrough: false,
+            emph: false,
+            mono: false,
+        }
+    }
+}
+
+impl PhraseElement {
+    fn spans<'a>(self) -> Vec<Span<'a, String>> {
+        self.spans_with(Default::default()).collect()
     }
 
-    fn crypto_client(&self) -> Arc<CryptoEntityClient> {
-        self.session.mail_facade().get_crypto_entity_client()
+    fn spans_with(self, style: SpanStyle) -> Box<dyn Iterator<Item = Span<'static, String>>> {
+        match self {
+            PhraseElement::Text(string) => {
+                let mut span = span(string)
+                    .color_maybe(style.color)
+                    .underline(style.underline)
+                    .link_maybe(style.link)
+                    .font_maybe(if style.emph {
+                        Some(Font {
+                            style: Style::Italic,
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    })
+                    .font_maybe(if style.bold {
+                        Some(Font {
+                            weight: Weight::Bold,
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    })
+                    .font_maybe(if style.mono {
+                        Some(Font::MONOSPACE)
+                    } else {
+                        None
+                    })
+                    .strikethrough(style.strikethrough);
+                if let Some(size) = style.size {
+                    span = span.size(size);
+                }
+                Box::new(once(span))
+            }
+            PhraseElement::Span { children } => Box::new(
+                children
+                    .into_iter()
+                    .flat_map(move |child| child.spans_with(style.clone())),
+            ),
+            PhraseElement::Strong { children } => {
+                Box::new(children.into_iter().flat_map(move |child| {
+                    child.spans_with(SpanStyle {
+                        bold: true,
+                        ..style.clone()
+                    })
+                }))
+            }
+            PhraseElement::Emphasis { children } => {
+                Box::new(children.into_iter().flat_map(move |child| {
+                    child.spans_with(SpanStyle {
+                        emph: true,
+                        ..style.clone()
+                    })
+                }))
+            }
+            PhraseElement::Link { href, children } => {
+                Box::new(children.into_iter().flat_map(move |child| {
+                    child.spans_with(SpanStyle {
+                        link: Some(href.clone()),
+                        ..style.clone()
+                    })
+                }))
+            }
+            PhraseElement::Image {
+                src,
+                description,
+                width,
+                height,
+            } => todo!(),
+        }
     }
 }
 
@@ -92,80 +265,15 @@ impl FileMapper {
     }
 }
 
-#[async_trait]
-impl FileClient for FileMapper {
-    async fn persist_content(
-        &self,
-        key: String,
-        content: Vec<u8>,
-    ) -> std::result::Result<(), FileClientError> {
-        let content_path = self.file_to_store(key).map_err(|error| error.kind())?;
-        self.disk
-            .write(content_path, content)
-            .await
-            .map_err(|error| match error {
-                uring::Error::Channel => FileClientError::Unknown,
-                uring::Error::Io(error) => error.kind().into(),
-            })?;
-        Ok(())
-    }
-
-    async fn read_content(&self, key: String) -> std::result::Result<Vec<u8>, FileClientError> {
-        let content_path = self.file_to_store(key).map_err(|error| error.kind())?;
-        let data = self
-            .disk
-            .read(content_path)
-            .await
-            .map_err(|error| match error {
-                uring::Error::Channel => FileClientError::Unknown,
-                uring::Error::Io(error) => error.kind().into(),
-            })?;
-        Ok(data)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct EmailStorage {
-    tuta_db: DatabaseConnection,
     email_db: DatabaseConnection,
 }
 
 pub struct TutaAccount {}
 
 impl EmailStorage {
-    pub async fn open(
-        tuta_path: impl AsRef<Path>,
-        email_path: impl AsRef<Path>,
-        app_name: &str,
-    ) -> Result<Self> {
-        let tuta_db = {
-            let tuta_passphrase = get_passphrase(app_name, "tuta").await?;
-            let mut options = ConnectOptions::new(format!(
-                "sqlite://{}?mode=rwc",
-                tuta_path.as_ref().to_str().unwrap()
-            ));
-            options.set_application_name(app_name);
-            options.sqlcipher_key(hex::encode(&*tuta_passphrase));
-            options.max_connections(1);
-            let tuta_db = Database::connect(options)
-                .await
-                .map_err(|error| raise!(ErrorKind::Sqlite(error)))?;
-            tuta_db
-                .execute_unprepared(
-                    r#"
-                        pragma journal_mode = WAL;
-                        pragma synchronous = NORMAL;
-                    "#,
-                )
-                .await
-                .map_err(|error| raise!(ErrorKind::Sqlite(error)))?;
-            TutaMigrationHandler::up(&tuta_db, None)
-                .await
-                .map_err(|error| raise!(ErrorKind::Sqlite(error)))?;
-
-            tuta_db
-        };
-
+    pub async fn open(email_path: impl AsRef<Path>, app_name: &str) -> Result<Self> {
         let email_db = {
             let email_passphrase = get_passphrase(app_name, "email").await?;
             let mut options = ConnectOptions::new(format!(
@@ -190,109 +298,6 @@ impl EmailStorage {
             email_db
         };
 
-        Ok(Self { tuta_db })
-    }
-
-    pub async fn sync_tuta_accounts(&self, tuta_accounts: Vec<TutaAccountConfig>) -> Result<()> {
-        let transaction = self
-            .tuta_db
-            .begin()
-            .await
-            .map_err(|error| raise!(ErrorKind::Sqlite(error)))?;
-        let mut tuta_accounts = tuta_accounts.into_iter().collect::<HashSet<_>>();
-        Entity::delete_many()
-            .filter(
-                tuta_account::Column::Login
-                    .is_not_in(tuta_accounts.iter().map(|account| &account.login)),
-            )
-            .exec(&transaction)
-            .await
-            .map_err(|error| raise!(ErrorKind::Sqlite(error)))?;
-        for account in Entity::find()
-            .all(&transaction)
-            .await
-            .map_err(|error| raise!(ErrorKind::Sqlite(error)))?
-        {
-            let account = TutaAccountConfig {
-                login: account.login,
-            };
-            tuta_accounts.remove(&account);
-        }
-
-        Entity::insert_many(
-            tuta_accounts
-                .into_iter()
-                .map(|account| {
-                    let StoreEntry::File(pass_entry) =
-                        libpass::retrieve(&format!("ems/tuta/{}/login", account.login))
-                            .map_err(|error| raise!(ErrorKind::Pass(error)))?
-                    else {
-                        throw!(ErrorKind::PassEntryDir);
-                    };
-                    let password = String::from_utf8(
-                        pass_entry
-                            .plain_io_ro()
-                            .map_err(|error| raise!(ErrorKind::Pass(error)))?
-                            .as_ref()
-                            .trim_ascii()
-                            .to_vec(),
-                    )
-                    .unwrap();
-                    let StoreEntry::File(totp_entry) =
-                        libpass::retrieve(&format!("ems/tuta/{}/totp", account.login))
-                            .map_err(|error| raise!(ErrorKind::Pass(error)))?
-                    else {
-                        throw!(ErrorKind::PassEntryDir)
-                    };
-                    let totp = String::from_utf8(
-                        totp_entry
-                            .plain_io_ro()
-                            .map_err(|error| raise!(ErrorKind::Pass(error)))?
-                            .as_ref()
-                            .trim_ascii()
-                            .to_vec(),
-                    )
-                    .unwrap();
-                    Ok(tuta_account::ActiveModel {
-                        login: ActiveValue::Set(account.login),
-                        password: ActiveValue::Set(password),
-                        totp: ActiveValue::Set(totp),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )
-        .exec(&transaction)
-        .await
-        .map_err(|error| raise!(ErrorKind::Sqlite(error)))?;
-
-        transaction
-            .commit()
-            .await
-            .map_err(|error| raise!(ErrorKind::Sqlite(error)))?;
-        Ok(())
-    }
-
-    pub async fn tuta_accounts(&self) -> Result<Vec<Credentials>> {
-        let mut credentials = Vec::new();
-        for account in tuta_account::Entity::load()
-            .with(tuta_credential::Entity)
-            .all(&self.tuta_db)
-            .await
-            .map_err(|error| raise!(ErrorKind::Sqlite(error)))?
-            .into_iter()
-        {
-            if let Some(creds) = account.credentials.into_option() {
-                credentials.push(Credentials {
-                    login: creds.login,
-                    user_id: GeneratedId(creds.user_id),
-                    access_token: creds.access_token,
-                    encrypted_passphrase_key: creds.encrypted_passphrase_key,
-                    credential_type: creds.credential_type.0,
-                })
-            } else {
-                todo!()
-            }
-        }
-        Ok(credentials)
+        Ok(Self { email_db })
     }
 }
